@@ -61,8 +61,6 @@ var (
 	registry   = make(map[string]*FunctionInstance)
 	registryMu sync.RWMutex
 
-	// sharedTransport mantém um pool amplo de conexões TCP Keep-Alive para 127.0.0.1,
-	// evitando o limite padrão de 2 conexões ociosas do http.DefaultTransport em rajadas.
 	sharedTransport = &http.Transport{
 		MaxIdleConns:        1000,
 		MaxIdleConnsPerHost: 100,
@@ -80,7 +78,6 @@ var (
 	}
 )
 
-// waitForContainerHealth faz polling no endpoint /health da réplica até receber HTTP 200 OK.
 func waitForContainerHealth(functionName, hostPort string) error {
 	healthURL := fmt.Sprintf("http://127.0.0.1:%s/health", hostPort)
 	deadline := time.Now().Add(coldStartTimeout)
@@ -100,7 +97,6 @@ func waitForContainerHealth(functionName, hostPort string) error {
 	return fmt.Errorf("timeout aguardando /health da função '%s' na porta %s", functionName, hostPort)
 }
 
-// createAndStartReplica cria um novo container Docker para a réplica, inicia-o, descobre a HostPort e aguarda o /health.
 func createAndStartReplica(ctx context.Context, cli *client.Client, functionName, imageName, replicaName string) (*FunctionReplica, error) {
 	exposedPort := nat.Port(containerFunctionPort)
 
@@ -123,7 +119,7 @@ func createAndStartReplica(ctx context.Context, cli *client.Client, functionName
 			exposedPort: []nat.PortBinding{
 				{
 					HostIP:   "127.0.0.1",
-					HostPort: "", // Porta vazia instrui o Docker a escolher qualquer porta livre no host
+					HostPort: "",
 				},
 			},
 		},
@@ -163,7 +159,6 @@ func createAndStartReplica(ctx context.Context, cli *client.Client, functionName
 	}, nil
 }
 
-// wakeReplica inicia um container que estava "STOPPED", atualiza sua HostPort e aguarda o /health.
 func wakeReplica(ctx context.Context, functionName string, rep *FunctionReplica) (string, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
@@ -194,7 +189,6 @@ func wakeReplica(ctx context.Context, functionName string, rep *FunctionReplica)
 	return newHostPort, nil
 }
 
-// findLeastLoadedRunningReplica retorna a réplica RUNNING com o menor número de ActiveRequests (Least Connections).
 // Deve ser chamada com registryMu (Lock ou RLock) já adquirido.
 func findLeastLoadedRunningReplica(fn *FunctionInstance) *FunctionReplica {
 	var best *FunctionReplica
@@ -211,7 +205,7 @@ func findLeastLoadedRunningReplica(fn *FunctionInstance) *FunctionReplica {
 // selectOrScaleReplica escolhe a melhor réplica para atender a requisição.
 // Se necessário, acorda uma réplica parada (Cold Start) ou cria uma nova réplica (Scale-Up).
 func selectOrScaleReplica(ctx context.Context, fn *FunctionInstance) (*FunctionReplica, bool, error) {
-	// 1. Caminho Rápido (Fast Path): verifica se já existe uma réplica RUNNING com folga de concorrência,
+	// 1. Caminho Rápido: verifica se já existe uma réplica RUNNING com folga de concorrência,
 	// ou se o limite máximo de réplicas já foi atingido e todas estão rodando.
 	registryMu.Lock()
 	best := findLeastLoadedRunningReplica(fn)
@@ -232,7 +226,7 @@ func selectOrScaleReplica(ctx context.Context, fn *FunctionInstance) (*FunctionR
 	}
 	registryMu.Unlock()
 
-	// 2. Caminho Lento (Slow Path): precisamos fazer Cold Start de réplica parada ou Scale-Up de nova réplica.
+	// 2. Caminho Lento: precisamos fazer Cold Start de réplica parada ou Scale-Up de nova réplica.
 	fn.mu.Lock()
 	defer fn.mu.Unlock()
 
