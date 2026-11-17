@@ -20,6 +20,8 @@ import (
 const (
 	containerFunctionPort = "8080/tcp"
 	defaultIdleTimeout    = 60 * time.Second
+	defaultMaxReplicas    = 3
+	defaultMaxConcurrency = 4
 	reaperInterval        = 5 * time.Second
 	coldStartTimeout      = 15 * time.Second
 )
@@ -28,26 +30,295 @@ type DeployRequest struct {
 	FunctionName       string `json:"functionName"`
 	ImageName          string `json:"imageName"`
 	IdleTimeoutSeconds int    `json:"idleTimeoutSeconds,omitempty"`
+	MaxReplicas        int    `json:"maxReplicas,omitempty"`
+	MaxConcurrency     int    `json:"maxConcurrency,omitempty"`
 }
 
-// FunctionInstance representa o estado de uma função gerenciada pelo faas-agent no host.
+// FunctionReplica representa um container individual (réplica) de uma função no host.
+type FunctionReplica struct {
+	ReplicaName    string    `json:"replicaName"`
+	ContainerID    string    `json:"containerId"`
+	HostPort       string    `json:"hostPort"`
+	Status         string    `json:"status"` // "RUNNING" ou "STOPPED"
+	ActiveRequests int       `json:"activeRequests"`
+	LastUsedAt     time.Time `json:"lastUsedAt"`
+}
+
+// FunctionInstance representa o serviço de uma função gerenciada pelo faas-agent e seu pool de réplicas (1:N).
 type FunctionInstance struct {
-	FunctionName       string        `json:"functionName"`
-	ImageName          string        `json:"imageName"`
-	ContainerID        string        `json:"containerId"`
-	HostPort           string        `json:"hostPort"`
-	Status             string        `json:"status"` // "RUNNING" ou "STOPPED"
-	LastUsedAt         time.Time     `json:"lastUsedAt"`
-	ActiveRequests     int           `json:"activeRequests"`
-	IdleTimeoutSeconds int           `json:"idleTimeoutSeconds"`
-	IdleTimeout        time.Duration `json:"-"`
-	mu                 sync.Mutex    // Evita que duas requisições façam Cold Start do mesmo container ao mesmo tempo
+	FunctionName       string             `json:"functionName"`
+	ImageName          string             `json:"imageName"`
+	IdleTimeoutSeconds int                `json:"idleTimeoutSeconds"`
+	IdleTimeout        time.Duration      `json:"-"`
+	MaxReplicas        int                `json:"maxReplicas"`
+	MaxConcurrency     int                `json:"maxConcurrency"`
+	Replicas           []*FunctionReplica `json:"replicas"`
+	nextReplicaSeq     int                // Contador interno para gerar nomes únicos de réplica
+	mu                 sync.Mutex         // Serializa operações no Docker (Cold Start, Scale-Up e Scale-Down)
 }
 
 var (
 	registry   = make(map[string]*FunctionInstance)
 	registryMu sync.RWMutex
+
+	// sharedTransport mantém um pool amplo de conexões TCP Keep-Alive para 127.0.0.1,
+	// evitando o limite padrão de 2 conexões ociosas do http.DefaultTransport em rajadas.
+	sharedTransport = &http.Transport{
+		MaxIdleConns:        1000,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+	}
+
+	proxyClient = &http.Client{
+		Timeout:   60 * time.Second,
+		Transport: sharedTransport,
+	}
+
+	healthClient = &http.Client{
+		Timeout:   500 * time.Millisecond,
+		Transport: sharedTransport,
+	}
 )
+
+// waitForContainerHealth faz polling no endpoint /health da réplica até receber HTTP 200 OK.
+func waitForContainerHealth(functionName, hostPort string) error {
+	healthURL := fmt.Sprintf("http://127.0.0.1:%s/health", hostPort)
+	deadline := time.Now().Add(coldStartTimeout)
+
+	for time.Now().Before(deadline) {
+		resp, err := healthClient.Get(healthURL)
+		if err == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return nil
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	return fmt.Errorf("timeout aguardando /health da função '%s' na porta %s", functionName, hostPort)
+}
+
+// createAndStartReplica cria um novo container Docker para a réplica, inicia-o, descobre a HostPort e aguarda o /health.
+func createAndStartReplica(ctx context.Context, cli *client.Client, functionName, imageName, replicaName string) (*FunctionReplica, error) {
+	exposedPort := nat.Port(containerFunctionPort)
+
+	containerConfig := &container.Config{
+		Image: imageName,
+		Env: []string{
+			"FUNCTION_NAME=" + functionName,
+		},
+		Labels: map[string]string{
+			"faas.function": functionName,
+			"faas.replica":  replicaName,
+		},
+		ExposedPorts: nat.PortSet{
+			exposedPort: struct{}{},
+		},
+	}
+
+	hostConfig := &container.HostConfig{
+		PortBindings: nat.PortMap{
+			exposedPort: []nat.PortBinding{
+				{
+					HostIP:   "127.0.0.1",
+					HostPort: "", // Porta vazia instrui o Docker a escolher qualquer porta livre no host
+				},
+			},
+		},
+	}
+
+	resp, err := cli.ContainerCreate(ctx, containerConfig, hostConfig, nil, nil, replicaName)
+	if err != nil {
+		return nil, fmt.Errorf("erro ao criar container '%s': %w", replicaName, err)
+	}
+
+	if err := cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		return nil, fmt.Errorf("erro ao iniciar container '%s': %w", replicaName, err)
+	}
+
+	inspect, err := cli.ContainerInspect(ctx, resp.ID)
+	if err != nil {
+		return nil, fmt.Errorf("erro ao inspecionar container '%s': %w", replicaName, err)
+	}
+
+	bindings := inspect.NetworkSettings.Ports[exposedPort]
+	if len(bindings) == 0 || bindings[0].HostPort == "" {
+		return nil, fmt.Errorf("nenhuma porta foi mapeada no host para a réplica '%s'", replicaName)
+	}
+	hostPort := bindings[0].HostPort
+
+	if err := waitForContainerHealth(functionName, hostPort); err != nil {
+		return nil, err
+	}
+
+	return &FunctionReplica{
+		ReplicaName:    replicaName,
+		ContainerID:    resp.ID[:12],
+		HostPort:       hostPort,
+		Status:         "RUNNING",
+		ActiveRequests: 0,
+		LastUsedAt:     time.Now(),
+	}, nil
+}
+
+// wakeReplica inicia um container que estava "STOPPED", atualiza sua HostPort e aguarda o /health.
+func wakeReplica(ctx context.Context, functionName string, rep *FunctionReplica) (string, error) {
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return "", fmt.Errorf("erro ao conectar no Docker: %w", err)
+	}
+	defer cli.Close()
+
+	if err := cli.ContainerStart(ctx, rep.ContainerID, container.StartOptions{}); err != nil {
+		return "", fmt.Errorf("erro ao iniciar container %s: %w", rep.ContainerID, err)
+	}
+
+	inspect, err := cli.ContainerInspect(ctx, rep.ContainerID)
+	if err != nil {
+		return "", fmt.Errorf("erro ao inspecionar container após start: %w", err)
+	}
+
+	exposedPort := nat.Port(containerFunctionPort)
+	bindings := inspect.NetworkSettings.Ports[exposedPort]
+	if len(bindings) == 0 || bindings[0].HostPort == "" {
+		return "", fmt.Errorf("nenhuma porta mapeada no host após reiniciar réplica '%s'", rep.ReplicaName)
+	}
+	newHostPort := bindings[0].HostPort
+
+	if err := waitForContainerHealth(functionName, newHostPort); err != nil {
+		return "", err
+	}
+
+	return newHostPort, nil
+}
+
+// findLeastLoadedRunningReplica retorna a réplica RUNNING com o menor número de ActiveRequests (Least Connections).
+// Deve ser chamada com registryMu (Lock ou RLock) já adquirido.
+func findLeastLoadedRunningReplica(fn *FunctionInstance) *FunctionReplica {
+	var best *FunctionReplica
+	for _, rep := range fn.Replicas {
+		if rep.Status == "RUNNING" {
+			if best == nil || rep.ActiveRequests < best.ActiveRequests {
+				best = rep
+			}
+		}
+	}
+	return best
+}
+
+// selectOrScaleReplica escolhe a melhor réplica para atender a requisição.
+// Se necessário, acorda uma réplica parada (Cold Start) ou cria uma nova réplica (Scale-Up).
+func selectOrScaleReplica(ctx context.Context, fn *FunctionInstance) (*FunctionReplica, bool, error) {
+	// 1. Caminho Rápido (Fast Path): verifica se já existe uma réplica RUNNING com folga de concorrência,
+	// ou se o limite máximo de réplicas já foi atingido e todas estão rodando.
+	registryMu.Lock()
+	best := findLeastLoadedRunningReplica(fn)
+	allRunningAtMaxCap := len(fn.Replicas) >= fn.MaxReplicas && best != nil
+	hasStoppedReplica := false
+	for _, rep := range fn.Replicas {
+		if rep.Status == "STOPPED" {
+			hasStoppedReplica = true
+			break
+		}
+	}
+
+	if best != nil && (best.ActiveRequests < fn.MaxConcurrency || (allRunningAtMaxCap && !hasStoppedReplica)) {
+		best.ActiveRequests++
+		best.LastUsedAt = time.Now()
+		registryMu.Unlock()
+		return best, false, nil
+	}
+	registryMu.Unlock()
+
+	// 2. Caminho Lento (Slow Path): precisamos fazer Cold Start de réplica parada ou Scale-Up de nova réplica.
+	fn.mu.Lock()
+	defer fn.mu.Unlock()
+
+	// Revalida o estado após adquirir fn.mu (outra goroutine pode ter acabado de subir uma réplica).
+	registryMu.Lock()
+	best = findLeastLoadedRunningReplica(fn)
+	if best != nil && best.ActiveRequests < fn.MaxConcurrency {
+		best.ActiveRequests++
+		best.LastUsedAt = time.Now()
+		registryMu.Unlock()
+		return best, false, nil
+	}
+
+	// 2a. Verifica se há alguma réplica STOPPED que possamos acordar antes de criar um container novo.
+	var stoppedRep *FunctionReplica
+	for _, rep := range fn.Replicas {
+		if rep.Status == "STOPPED" {
+			stoppedRep = rep
+			break
+		}
+	}
+	if stoppedRep != nil {
+		registryMu.Unlock()
+
+		fmt.Printf("-> [Cold Start] Acordando réplica '%s' (%s)...\n", stoppedRep.ReplicaName, stoppedRep.ContainerID)
+		newHostPort, err := wakeReplica(ctx, fn.FunctionName, stoppedRep)
+		if err != nil {
+			return nil, false, err
+		}
+
+		registryMu.Lock()
+		stoppedRep.HostPort = newHostPort
+		stoppedRep.Status = "RUNNING"
+		stoppedRep.ActiveRequests++
+		stoppedRep.LastUsedAt = time.Now()
+		registryMu.Unlock()
+
+		fmt.Printf("-> [Cold Start] Réplica '%s' pronta em 127.0.0.1:%s!\n", stoppedRep.ReplicaName, newHostPort)
+		return stoppedRep, true, nil
+	}
+
+	// 2b. Se todas as réplicas atuais estão ocupadas (>= MaxConcurrency) e ainda podemos escalar (< MaxReplicas),
+	// criamos uma nova réplica horizontalmente (Scale-Up).
+	if len(fn.Replicas) < fn.MaxReplicas {
+		fn.nextReplicaSeq++
+		replicaName := fmt.Sprintf("%s-rep-%d", fn.FunctionName, fn.nextReplicaSeq)
+		currentCount := len(fn.Replicas) + 1
+		maxReplicas := fn.MaxReplicas
+		registryMu.Unlock()
+
+		fmt.Printf("-> [Auto-Scale] Alta demanda em '%s'! Criando nova réplica '%s' (%d/%d)...\n",
+			fn.FunctionName, replicaName, currentCount, maxReplicas)
+
+		cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+		if err != nil {
+			return nil, false, fmt.Errorf("erro ao conectar no Docker para Scale-Up: %w", err)
+		}
+		defer cli.Close()
+
+		newRep, err := createAndStartReplica(ctx, cli, fn.FunctionName, fn.ImageName, replicaName)
+		if err != nil {
+			return nil, false, err
+		}
+
+		registryMu.Lock()
+		newRep.ActiveRequests = 1
+		newRep.LastUsedAt = time.Now()
+		fn.Replicas = append(fn.Replicas, newRep)
+		registryMu.Unlock()
+
+		fmt.Printf("-> [Auto-Scale] Réplica '%s' pronta em 127.0.0.1:%s (Container ID: %s)!\n",
+			newRep.ReplicaName, newRep.HostPort, newRep.ContainerID)
+		return newRep, true, nil
+	}
+
+	// 2c. Já atingimos MaxReplicas e todas estão RUNNING: usa Least Connections na réplica menos sobrecarregada.
+	best = findLeastLoadedRunningReplica(fn)
+	if best == nil {
+		registryMu.Unlock()
+		return nil, false, fmt.Errorf("nenhuma réplica disponível para a função '%s'", fn.FunctionName)
+	}
+	best.ActiveRequests++
+	best.LastUsedAt = time.Now()
+	registryMu.Unlock()
+	return best, false, nil
+}
 
 func deployHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -71,8 +342,18 @@ func deployHandler(w http.ResponseWriter, r *http.Request) {
 		idleTimeout = time.Duration(req.IdleTimeoutSeconds) * time.Second
 	}
 
-	fmt.Printf("-> [Deploy] Solicitado deploy da função '%s' com a imagem '%s' (IdleTimeout: %v)\n",
-		req.FunctionName, req.ImageName, idleTimeout)
+	maxReplicas := defaultMaxReplicas
+	if req.MaxReplicas > 0 {
+		maxReplicas = req.MaxReplicas
+	}
+
+	maxConcurrency := defaultMaxConcurrency
+	if req.MaxConcurrency > 0 {
+		maxConcurrency = req.MaxConcurrency
+	}
+
+	fmt.Printf("-> [Deploy] Função '%s' | Imagem: '%s' | IdleTimeout: %v | MaxReplicas: %d | MaxConcurrency: %d\n",
+		req.FunctionName, req.ImageName, idleTimeout, maxReplicas, maxConcurrency)
 
 	ctx := context.Background()
 
@@ -98,76 +379,34 @@ func deployHandler(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("-> [Docker] Imagem '%s' encontrada localmente, pulando download.\n", req.ImageName)
 	}
 
-	// 2. Configura a exposição da porta 8080/tcp do contrato e o Port Binding dinâmico no host (HostPort: "").
-	exposedPort := nat.Port(containerFunctionPort)
+	// 2. Cria e inicia a réplica primária (#1) aguardando seu /health.
+	firstReplicaName := fmt.Sprintf("%s-rep-1", req.FunctionName)
+	fmt.Printf("-> [Docker] Criando réplica inicial '%s'...\n", firstReplicaName)
 
-	containerConfig := &container.Config{
-		Image: req.ImageName,
-		Env: []string{
-			"FUNCTION_NAME=" + req.FunctionName,
-		},
-		ExposedPorts: nat.PortSet{
-			exposedPort: struct{}{},
-		},
-	}
-
-	hostConfig := &container.HostConfig{
-		PortBindings: nat.PortMap{
-			exposedPort: []nat.PortBinding{
-				{
-					HostIP:   "127.0.0.1",
-					HostPort: "", // Porta vazia instrui o Docker a escolher qualquer porta livre no host
-				},
-			},
-		},
-	}
-
-	fmt.Println("-> [Docker] Criando container com Port Binding dinâmico...")
-	resp, err := cli.ContainerCreate(ctx, containerConfig, hostConfig, nil, nil, req.FunctionName)
+	firstReplica, err := createAndStartReplica(ctx, cli, req.FunctionName, req.ImageName, firstReplicaName)
 	if err != nil {
-		http.Error(w, "Erro ao criar container: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Erro ao criar réplica inicial: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	fmt.Println("-> [Docker] Iniciando container...")
-	if err := cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
-		http.Error(w, "Erro ao iniciar container: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// 3. Inspeciona o container em execução para descobrir qual porta do host o Docker alocou.
-	inspect, err := cli.ContainerInspect(ctx, resp.ID)
-	if err != nil {
-		http.Error(w, "Erro ao inspecionar container: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	bindings := inspect.NetworkSettings.Ports[exposedPort]
-	if len(bindings) == 0 || bindings[0].HostPort == "" {
-		http.Error(w, "Nenhuma porta foi mapeada no host para o container", http.StatusInternalServerError)
-		return
-	}
-	hostPort := bindings[0].HostPort
-
-	// 4. Salva o estado da função no registro em memória.
+	// 3. Registra o serviço da função e seu pool de réplicas em memória.
 	instance := &FunctionInstance{
 		FunctionName:       req.FunctionName,
 		ImageName:          req.ImageName,
-		ContainerID:        resp.ID[:12],
-		HostPort:           hostPort,
-		Status:             "RUNNING",
-		LastUsedAt:         time.Now(),
-		ActiveRequests:     0,
 		IdleTimeoutSeconds: int(idleTimeout.Seconds()),
 		IdleTimeout:        idleTimeout,
+		MaxReplicas:        maxReplicas,
+		MaxConcurrency:     maxConcurrency,
+		Replicas:           []*FunctionReplica{firstReplica},
+		nextReplicaSeq:     1,
 	}
 
 	registryMu.Lock()
 	registry[req.FunctionName] = instance
 	registryMu.Unlock()
 
-	fmt.Printf("-> [Sucesso] Função '%s' rodando em 127.0.0.1:%s (Container ID: %s)\n",
-		instance.FunctionName, instance.HostPort, instance.ContainerID)
+	fmt.Printf("-> [Sucesso] Função '%s' implantada! Réplica '%s' rodando em 127.0.0.1:%s (Container ID: %s)\n",
+		instance.FunctionName, firstReplica.ReplicaName, firstReplica.HostPort, firstReplica.ContainerID)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -192,78 +431,6 @@ func listFunctionsHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(functions)
 }
 
-// ensureFunctionRunning garante que o container da função esteja rodando.
-// Se estiver "STOPPED", realiza o Cold Start (ContainerStart + atualização da porta + espera pelo /health).
-func ensureFunctionRunning(ctx context.Context, instance *FunctionInstance) (bool, error) {
-	instance.mu.Lock()
-	defer instance.mu.Unlock()
-
-	registryMu.RLock()
-	status := instance.Status
-	registryMu.RUnlock()
-
-	if status == "RUNNING" {
-		return false, nil
-	}
-
-	fmt.Printf("-> [Cold Start] Acordando container da função '%s' (%s)...\n",
-		instance.FunctionName, instance.ContainerID)
-
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-	if err != nil {
-		return false, fmt.Errorf("erro ao conectar no Docker: %w", err)
-	}
-	defer cli.Close()
-
-	if err := cli.ContainerStart(ctx, instance.ContainerID, container.StartOptions{}); err != nil {
-		return false, fmt.Errorf("erro ao iniciar container: %w", err)
-	}
-
-	// Ao religar um container com porta dinâmica, o Docker pode alocar uma nova porta livre no host.
-	inspect, err := cli.ContainerInspect(ctx, instance.ContainerID)
-	if err != nil {
-		return false, fmt.Errorf("erro ao inspecionar container após start: %w", err)
-	}
-
-	exposedPort := nat.Port(containerFunctionPort)
-	bindings := inspect.NetworkSettings.Ports[exposedPort]
-	if len(bindings) == 0 || bindings[0].HostPort == "" {
-		return false, fmt.Errorf("nenhuma porta mapeada no host após reiniciar container")
-	}
-	newHostPort := bindings[0].HostPort
-
-	// Faz polling no endpoint /health do container até o servidor Python estar pronto para aceitar requisições.
-	healthURL := fmt.Sprintf("http://127.0.0.1:%s/health", newHostPort)
-	httpClient := &http.Client{Timeout: 500 * time.Millisecond}
-	deadline := time.Now().Add(coldStartTimeout)
-
-	ready := false
-	for time.Now().Before(deadline) {
-		resp, err := httpClient.Get(healthURL)
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				ready = true
-				break
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-
-	if !ready {
-		return false, fmt.Errorf("timeout aguardando /health da função '%s' na porta %s", instance.FunctionName, newHostPort)
-	}
-
-	registryMu.Lock()
-	instance.HostPort = newHostPort
-	instance.Status = "RUNNING"
-	instance.LastUsedAt = time.Now()
-	registryMu.Unlock()
-
-	fmt.Printf("-> [Cold Start] Função '%s' pronta em 127.0.0.1:%s!\n", instance.FunctionName, newHostPort)
-	return true, nil
-}
-
 func invokeHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Apenas o método POST é permitido", http.StatusMethodNotAllowed)
@@ -276,42 +443,39 @@ func invokeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Busca a função e incrementa ActiveRequests para impedir que o Reaper pare o container durante a chamada.
-	registryMu.Lock()
+	registryMu.RLock()
 	instance, exists := registry[functionName]
-	if exists {
-		instance.ActiveRequests++
-		instance.LastUsedAt = time.Now()
-	}
-	registryMu.Unlock()
+	registryMu.RUnlock()
 
 	if !exists {
 		http.Error(w, fmt.Sprintf("Função '%s' não encontrada no agente", functionName), http.StatusNotFound)
 		return
 	}
 
-	// Garante que ao final da requisição o contador de chamadas ativas seja decrementado e LastUsedAt atualizado.
-	defer func() {
-		registryMu.Lock()
-		instance.ActiveRequests--
-		instance.LastUsedAt = time.Now()
-		registryMu.Unlock()
-	}()
-
 	startTime := time.Now()
 
-	// 2. Se o container estiver parado (STOPPED), realiza o Cold Start transparente antes do proxy.
-	coldStart, err := ensureFunctionRunning(r.Context(), instance)
+	// 1. Seleciona a réplica menos ocupada (Least Connections), acorda uma parada (Cold Start)
+	// ou cria uma réplica nova (Scale-Up) se todas estiverem saturadas.
+	replica, coldStart, err := selectOrScaleReplica(r.Context(), instance)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Falha no Cold Start da função '%s': %v", functionName, err), http.StatusBadGateway)
+		http.Error(w, fmt.Sprintf("Falha ao obter réplica para '%s': %v", functionName, err), http.StatusBadGateway)
 		return
 	}
 
+	// Garante que o contador de requisições ativas desta réplica específica seja decrementado ao terminar.
+	defer func() {
+		registryMu.Lock()
+		replica.ActiveRequests--
+		replica.LastUsedAt = time.Now()
+		registryMu.Unlock()
+	}()
+
 	registryMu.RLock()
-	hostPort := instance.HostPort
+	hostPort := replica.HostPort
+	replicaName := replica.ReplicaName
 	registryMu.RUnlock()
 
-	// 3. Monta a URL interna do container na porta mapeada no host.
+	// 2. Monta a URL interna da réplica selecionada.
 	targetURL := fmt.Sprintf("http://127.0.0.1:%s/", hostPort)
 	if r.URL.RawQuery != "" {
 		targetURL += "?" + r.URL.RawQuery
@@ -329,25 +493,25 @@ func invokeHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 4. Dispara a requisição para o container.
-	resp, err := http.DefaultClient.Do(proxyReq)
+	// 3. Dispara a requisição usando o pool de conexões HTTP (proxyClient).
+	resp, err := proxyClient.Do(proxyReq)
 	durationMs := time.Since(startTime).Milliseconds()
 
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Erro ao comunicar com o container da função '%s': %v", functionName, err), http.StatusBadGateway)
+		http.Error(w, fmt.Sprintf("Erro ao comunicar com a réplica '%s': %v", replicaName, err), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
 	mode := "Warm Start"
 	if coldStart {
-		mode = "Cold Start"
+		mode = "Cold Start / Scale-Up"
 	}
 
-	fmt.Printf("-> [Invoke] Função '%s' executada (%s) | Status: %d | Duração: %dms\n",
-		functionName, mode, resp.StatusCode, durationMs)
+	fmt.Printf("-> [Invoke] Função '%s' [%s] (%s) | Status: %d | Duração: %dms\n",
+		functionName, replicaName, mode, resp.StatusCode, durationMs)
 
-	// 5. Repassa cabeçalhos da resposta do container + metadados de telemetria.
+	// 4. Repassa cabeçalhos da resposta do container + metadados de telemetria.
 	for key, values := range resp.Header {
 		for _, value := range values {
 			w.Header().Add(key, value)
@@ -355,6 +519,7 @@ func invokeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("X-Execution-Duration-Ms", fmt.Sprintf("%d", durationMs))
 	w.Header().Set("X-Cold-Start", fmt.Sprintf("%t", coldStart))
+	w.Header().Set("X-Replica-Name", replicaName)
 
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
@@ -372,18 +537,28 @@ func deleteFunctionHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	registryMu.Lock()
+	registryMu.RLock()
 	instance, exists := registry[functionName]
+	registryMu.RUnlock()
+
 	if !exists {
-		registryMu.Unlock()
 		http.Error(w, fmt.Sprintf("Função '%s' não encontrada", functionName), http.StatusNotFound)
 		return
 	}
-	if instance.ActiveRequests > 0 {
-		registryMu.Unlock()
-		http.Error(w, "Não é possível remover a função enquanto há requisições em andamento", http.StatusConflict)
-		return
+
+	instance.mu.Lock()
+	defer instance.mu.Unlock()
+
+	registryMu.Lock()
+	for _, rep := range instance.Replicas {
+		if rep.ActiveRequests > 0 {
+			registryMu.Unlock()
+			http.Error(w, "Não é possível remover a função enquanto há requisições em andamento", http.StatusConflict)
+			return
+		}
 	}
+	replicasToRemove := make([]*FunctionReplica, len(instance.Replicas))
+	copy(replicasToRemove, instance.Replicas)
 	delete(registry, functionName)
 	registryMu.Unlock()
 
@@ -394,47 +569,64 @@ func deleteFunctionHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer cli.Close()
 
-	if err := cli.ContainerRemove(context.Background(), instance.ContainerID, container.RemoveOptions{Force: true}); err != nil {
-		http.Error(w, "Erro ao remover container: "+err.Error(), http.StatusInternalServerError)
-		return
+	for _, rep := range replicasToRemove {
+		if err := cli.ContainerRemove(context.Background(), rep.ContainerID, container.RemoveOptions{Force: true}); err != nil {
+			log.Printf("-> [Delete] Aviso ao remover container %s (%s): %v\n", rep.ReplicaName, rep.ContainerID, err)
+		} else {
+			fmt.Printf("-> [Delete] Réplica '%s' (Container ID: %s) removida.\n", rep.ReplicaName, rep.ContainerID)
+		}
 	}
 
-	fmt.Printf("-> [Delete] Função '%s' (Container ID: %s) removida com sucesso!\n",
-		functionName, instance.ContainerID)
-
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"message":      fmt.Sprintf("Função '%s' removida com sucesso", functionName),
-		"functionName": functionName,
+	json.NewEncoder(w).Encode(map[string]any{
+		"message":         fmt.Sprintf("Função '%s' e suas %d réplica(s) removidas com sucesso", functionName, len(replicasToRemove)),
+		"functionName":    functionName,
+		"removedReplicas": len(replicasToRemove),
 	})
 }
 
-// startIdleReaper monitora periodicamente as funções em memória e para os containers ociosos (Scale-to-Zero).
+// startIdleReaper monitora periodicamente as réplicas de cada função:
+// - Réplicas extras (índice > 0) ociosas são removidas (Scale-Down com ContainerRemove).
+// - A réplica primária (índice == 0) ociosa é apenas parada (Scale-to-Zero com ContainerStop).
 func startIdleReaper() {
 	ticker := time.NewTicker(reaperInterval)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		// Coleta candidatas ociosas primeiro para não segurar o lock global durante chamadas ao Docker.
-		var idleCandidates []*FunctionInstance
-
+		var functions []*FunctionInstance
 		registryMu.RLock()
 		for _, fn := range registry {
-			if fn.Status == "RUNNING" && fn.ActiveRequests == 0 && time.Since(fn.LastUsedAt) > fn.IdleTimeout {
-				idleCandidates = append(idleCandidates, fn)
-			}
+			functions = append(functions, fn)
 		}
 		registryMu.RUnlock()
 
-		for _, fn := range idleCandidates {
+		for _, fn := range functions {
 			fn.mu.Lock()
 
-			// Revalida o estado após adquirir o lock individual da função.
 			registryMu.RLock()
-			stillIdle := fn.Status == "RUNNING" && fn.ActiveRequests == 0 && time.Since(fn.LastUsedAt) > fn.IdleTimeout
+			if len(fn.Replicas) == 0 {
+				registryMu.RUnlock()
+				fn.mu.Unlock()
+				continue
+			}
+
+			var extraIdle []*FunctionReplica
+			var stopPrimary *FunctionReplica
+
+			for i, rep := range fn.Replicas {
+				isIdle := rep.Status == "RUNNING" && rep.ActiveRequests == 0 && time.Since(rep.LastUsedAt) > fn.IdleTimeout
+				if !isIdle {
+					continue
+				}
+				if i == 0 {
+					stopPrimary = rep
+				} else {
+					extraIdle = append(extraIdle, rep)
+				}
+			}
 			registryMu.RUnlock()
 
-			if !stillIdle {
+			if stopPrimary == nil && len(extraIdle) == 0 {
 				fn.mu.Unlock()
 				continue
 			}
@@ -446,17 +638,46 @@ func startIdleReaper() {
 				continue
 			}
 
-			fmt.Printf("-> [Reaper] Função '%s' ociosa há >%v. Parando container %s (Scale-to-Zero)...\n",
-				fn.FunctionName, fn.IdleTimeout, fn.ContainerID)
+			// 1. Scale-Down: remove containers de réplicas extras ociosas.
+			if len(extraIdle) > 0 {
+				removedIDs := make(map[string]bool)
+				for _, rep := range extraIdle {
+					fmt.Printf("-> [Reaper / Scale-Down] Réplica extra '%s' ociosa há >%v. Removendo container %s...\n",
+						rep.ReplicaName, fn.IdleTimeout, rep.ContainerID)
+					if err := cli.ContainerRemove(context.Background(), rep.ContainerID, container.RemoveOptions{Force: true}); err != nil {
+						log.Printf("-> [Reaper] Erro ao remover réplica extra %s: %v\n", rep.ContainerID, err)
+					} else {
+						removedIDs[rep.ContainerID] = true
+						fmt.Printf("-> [Reaper / Scale-Down] Réplica extra '%s' removida com sucesso!\n", rep.ReplicaName)
+					}
+				}
 
-			if err := cli.ContainerStop(context.Background(), fn.ContainerID, container.StopOptions{}); err != nil {
-				log.Printf("-> [Reaper] Erro ao parar container %s: %v\n", fn.ContainerID, err)
-			} else {
-				registryMu.Lock()
-				fn.Status = "STOPPED"
-				fn.HostPort = ""
-				registryMu.Unlock()
-				fmt.Printf("-> [Reaper] Container da função '%s' parado com sucesso!\n", fn.FunctionName)
+				if len(removedIDs) > 0 {
+					registryMu.Lock()
+					kept := make([]*FunctionReplica, 0, len(fn.Replicas))
+					for _, rep := range fn.Replicas {
+						if !removedIDs[rep.ContainerID] {
+							kept = append(kept, rep)
+						}
+					}
+					fn.Replicas = kept
+					registryMu.Unlock()
+				}
+			}
+
+			// 2. Scale-to-Zero: para o container da réplica primária (#1) se também estiver ociosa.
+			if stopPrimary != nil {
+				fmt.Printf("-> [Reaper / Scale-to-Zero] Réplica primária '%s' ociosa há >%v. Parando container %s...\n",
+					stopPrimary.ReplicaName, fn.IdleTimeout, stopPrimary.ContainerID)
+				if err := cli.ContainerStop(context.Background(), stopPrimary.ContainerID, container.StopOptions{}); err != nil {
+					log.Printf("-> [Reaper] Erro ao parar réplica primária %s: %v\n", stopPrimary.ContainerID, err)
+				} else {
+					registryMu.Lock()
+					stopPrimary.Status = "STOPPED"
+					stopPrimary.HostPort = ""
+					registryMu.Unlock()
+					fmt.Printf("-> [Reaper / Scale-to-Zero] Réplica primária '%s' parada com sucesso!\n", stopPrimary.ReplicaName)
+				}
 			}
 
 			cli.Close()
@@ -473,7 +694,7 @@ func main() {
 	http.HandleFunc("/invoke/{functionName}", invokeHandler)
 	http.HandleFunc("/function/{functionName}", deleteFunctionHandler)
 
-	fmt.Println("Faas-Agent rodando na porta 8081 (Idle Reaper ativo)...")
+	fmt.Println("Faas-Agent rodando na porta 8081 (Auto-Scaler + Idle Reaper ativos)...")
 	if err := http.ListenAndServe(":8081", nil); err != nil {
 		log.Fatal("Erro ao iniciar o servidor: ", err)
 	}
