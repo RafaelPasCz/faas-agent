@@ -3,7 +3,8 @@ FROM python:3.12-slim
 # Evita geração de arquivos .pyc e força logs em tempo real no stdout do container
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PORT=8080
+    PORT=8080 \
+    WORKERS=8
 
 WORKDIR /app
 
