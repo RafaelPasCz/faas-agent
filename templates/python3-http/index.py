@@ -55,5 +55,6 @@ def invoke():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
-    print(f"[Runtime Wrapper] Iniciando servidor na porta {port}...")
-    serve(app, host="0.0.0.0", port=port)
+    workers = int(os.getenv("WORKERS", "8"))
+    print(f"[Runtime Wrapper] Iniciando servidor na porta {port} (workers={workers})...")
+    serve(app, host="0.0.0.0", port=port, threads=workers)
