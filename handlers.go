@@ -70,12 +70,20 @@ func (a *Agent) deployHandler(w http.ResponseWriter, r *http.Request) {
 	// 1. Verifica se a imagem já existe localmente; se não existir, faz o pull do registro remoto.
 	_, _, err = cli.ImageInspectWithRaw(ctx, req.ImageName)
 	if err != nil {
+
+		if client.IsErrNotFound(err) {
+			http.Error(w, "Erro ao consultar a imagem do docker: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
 		fmt.Printf("-> [Docker] Imagem '%s' não encontrada localmente. Baixando...\n", req.ImageName)
 		reader, pullErr := cli.ImagePull(ctx, req.ImageName, image.PullOptions{})
+
 		if pullErr != nil {
 			http.Error(w, "Erro ao baixar imagem: "+pullErr.Error(), http.StatusInternalServerError)
 			return
 		}
+
 		defer reader.Close()
 		io.Copy(os.Stdout, reader)
 	} else {
