@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 )
@@ -43,6 +44,11 @@ func NewAgent(logStore *ExecutionLogStore, stateFilePath string) *Agent {
 }
 
 func main() {
+	if len(os.Args) > 1 {
+		runCLI(os.Args[1:])
+		return
+	}
+
 	logStore, err := NewExecutionLogStore(resolveLogFilePath())
 	if err != nil {
 		log.Printf("-> [Logs] Aviso ao carregar histórico de execuções: %v\n", err)

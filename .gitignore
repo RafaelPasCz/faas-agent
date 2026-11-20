@@ -49,6 +49,9 @@ testes/
 #anotações do projeto
 notas/
 
+#funcoes criadas
+functions/
+
 # Dados e logs persistentes de execução local
 data/
 *.jsonl

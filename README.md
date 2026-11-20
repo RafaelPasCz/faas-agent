@@ -51,6 +51,12 @@ Para construir a imagem de exemplo localmente:
 docker build -t switchfaas/hello-python:latest ./templates/python3-http
 ```
 
+Para criar uma nova função customizada em `functions/<nome>/` a partir de um template:
+```bash
+go run . templates
+go run . new python3-http minha-funcao
+```
+
 ---
 
 ## Como Executar o Agente
@@ -83,6 +89,7 @@ faas-agent/
 ├── handlers.go   # Handlers HTTP (/deploy, /functions, /function/{name}, /invoke/{name})
 ├── docker.go     # Ciclo de vida de containers, Cold Start, Auto-Scaling e Idle Reaper
 ├── state.go      # Persistência de funções (data/functions.json) e reconciliação no boot
+├── template.go   # Subcomandos CLI (new, templates) e cópia de templates para functions/
 └── logs.go       # ExecutionLogStore (.jsonl append-only + compactação atômica) e GET /logs
 ```
 
