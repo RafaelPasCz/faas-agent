@@ -22,6 +22,7 @@ O `faas-agent` foi projetado sob a filosofia Unix: é um componente **100% autô
 - **Ciclo de Vida Inteligente (*Idle Reaper*):**
   - **Scale-Down:** Réplicas extras criadas durante picos de tráfego são removidas (`ContainerRemove`) ao ficarem ociosas além do `idleTimeoutSeconds`.
   - **Scale-to-Zero:** A réplica primária (`#1`) é pausada (`ContainerStop`) ao ficar ociosa, liberando memória RAM no host, e acordada automaticamente (*Cold Start* transparente) na próxima invocação.
+- **Persistência de Estado das Funções (`data/functions.json`):** Salva as funções implantadas de forma atômica (configurável via `FAAS_AGENT_STATE_FILE`) e reconcilia automaticamente com os containers Docker existentes no boot (re-adotando containers `RUNNING` ou `STOPPED` pela label `faas.function`).
 - **Persistência de Logs de Execução (JSON Lines):** Registra cada invocação em memória (últimas `1000` execuções) e persiste em disco no formato *append-only* (`data/execution_logs.jsonl`, configurável via `FAAS_AGENT_LOG_FILE`) com compactação atômica automática ao atingir `1200` linhas, recarregando o histórico e o último `id` ao reiniciar.
 - **Alta Performance de Rede:** Pool de conexões TCP *Keep-Alive* customizado (`http.Transport` com até 100 conexões ociosas por host) para eliminar gargalos de abertura de sockets em rajadas concorrentes.
 
@@ -69,7 +70,7 @@ docker build -t switchfaas/hello-python:latest ./templates/python3-http
    ```bash
    go run .
    ```
-   O servidor HTTP iniciará escutando na porta `:8081` com o *Auto-Scaler*, *Idle Reaper* e persistência de logs ativos (por padrão em `data/execution_logs.jsonl`, podendo ser customizado com `FAAS_AGENT_LOG_FILE`).
+   O servidor HTTP iniciará escutando na porta `:8081` com o *Auto-Scaler*, *Idle Reaper*, restauração automática das funções implantadas (`data/functions.json`, customizável com `FAAS_AGENT_STATE_FILE`) e persistência de logs ativos (`data/execution_logs.jsonl`, customizável com `FAAS_AGENT_LOG_FILE`).
 
 ---
 
@@ -81,6 +82,7 @@ faas-agent/
 ├── models.go     # Constantes, structs de domínio e cálculo de snapshot consolidado
 ├── handlers.go   # Handlers HTTP (/deploy, /functions, /function/{name}, /invoke/{name})
 ├── docker.go     # Ciclo de vida de containers, Cold Start, Auto-Scaling e Idle Reaper
+├── state.go      # Persistência de funções (data/functions.json) e reconciliação no boot
 └── logs.go       # ExecutionLogStore (.jsonl append-only + compactação atômica) e GET /logs
 ```
 
@@ -89,7 +91,10 @@ faas-agent/
 ## Endpoints da API
 
 ### `POST /deploy`
-Verifica se a imagem existe localmente (ou faz o pull caso não exista), cria e inicia a réplica primária (`<functionName>-rep-1`) com mapeamento dinâmico de porta (`127.0.0.1:<porta_livre> -> 8080/tcp`), aguarda o `/health` responder `200 OK` e registra a função no agente.
+Verifica se a imagem existe localmente (ou faz o pull caso não exista), cria e inicia a réplica primária (`<functionName>-rep-1`) com mapeamento dinâmico de porta (`127.0.0.1:<porta_livre> -> 8080/tcp`), aguarda o `/health` responder `200 OK`, registra a função no agente e persiste o estado em `data/functions.json`.
+
+- Retorna `409 Conflict` caso a função já esteja implantada na sessão atual do agente.
+- Caso haja um container órfão de sessão anterior com o mesmo nome, ele só é removido após validar a label `faas.function` (protegendo containers externos do host).
 
 **Payload (`application/json`):**
 ```json
@@ -194,3 +199,4 @@ curl -X DELETE http://localhost:8081/function/hello-python
 - [x] Gerenciamento de ciclo de vida (`GET /functions`, `GET /function/{functionName}`, `DELETE /function/{functionName}`, *Scale-to-Zero* com `ContainerStop` e *Cold Start* automático)
 - [x] Escalabilidade horizontal intra-nó (*Auto-Scaling* de múltiplas réplicas, balanceamento *Least Connections* e *Scale-Down* automático)
 - [x] Histórico persistente de logs de execução em JSON Lines (`.jsonl`) com endpoint `GET /logs` e coleta incremental (`afterId`)
+- [x] Persistência do estado das funções em disco (`data/functions.json`) com reconciliação de containers no boot e validação de segurança por label (`faas.function`)

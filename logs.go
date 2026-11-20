@@ -184,7 +184,7 @@ func (s *ExecutionLogStore) Record(functionName, replicaName string, statusCode 
 		RequestDurationMs: durationMs,
 		Success:           errMsg == "" && statusCode >= 200 && statusCode < 400,
 		ColdStart:         coldStart,
-		ExecutedAt:        time.Now().UTC(),
+		ExecutedAt:        time.Now(),
 		ErrorMessage:      errMsg,
 	}
 

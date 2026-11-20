@@ -13,9 +13,10 @@ const (
 	reaperInterval        = 5 * time.Second
 	coldStartTimeout      = 15 * time.Second
 
-	defaultLogFilePath  = "data/execution_logs.jsonl"
-	maxInMemoryLogs     = 1000
-	compactionThreshold = 1200
+	defaultLogFilePath   = "data/execution_logs.jsonl"
+	defaultStateFilePath = "data/functions.json"
+	maxInMemoryLogs      = 1000
+	compactionThreshold  = 1200
 )
 
 type DeployRequest struct {
@@ -24,6 +25,15 @@ type DeployRequest struct {
 	IdleTimeoutSeconds int    `json:"idleTimeoutSeconds,omitempty"`
 	MaxReplicas        int    `json:"maxReplicas,omitempty"`
 	MaxConcurrency     int    `json:"maxConcurrency,omitempty"`
+}
+
+// PersistedFunction representa a configuração persistida em disco de uma função implantada no agente.
+type PersistedFunction struct {
+	FunctionName       string `json:"functionName"`
+	ImageName          string `json:"imageName"`
+	IdleTimeoutSeconds int    `json:"idleTimeoutSeconds"`
+	MaxReplicas        int    `json:"maxReplicas"`
+	MaxConcurrency     int    `json:"maxConcurrency"`
 }
 
 // FunctionReplica representa um container individual (réplica) de uma função no host.

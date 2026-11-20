@@ -32,6 +32,14 @@ func (a *Agent) deployHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	a.registryMu.RLock()
+	_, alreadyExists := a.registry[req.FunctionName]
+	a.registryMu.RUnlock()
+	if alreadyExists {
+		http.Error(w, fmt.Sprintf("Conflito: a função '%s' já está implantada neste agente", req.FunctionName), http.StatusConflict)
+		return
+	}
+
 	idleTimeout := defaultIdleTimeout
 	if req.IdleTimeoutSeconds > 0 {
 		idleTimeout = time.Duration(req.IdleTimeoutSeconds) * time.Second
@@ -100,6 +108,10 @@ func (a *Agent) deployHandler(w http.ResponseWriter, r *http.Request) {
 	a.registry[req.FunctionName] = instance
 	snapshot := buildFunctionSnapshot(instance)
 	a.registryMu.Unlock()
+
+	if err := a.saveFunctionsState(); err != nil {
+		log.Printf("-> [State] Aviso ao salvar estado após deploy de '%s': %v\n", req.FunctionName, err)
+	}
 
 	fmt.Printf("-> [Sucesso] Função '%s' implantada! Réplica '%s' rodando em 127.0.0.1:%s (Container ID: %s)\n",
 		snapshot.FunctionName, firstReplica.ReplicaName, firstReplica.HostPort, firstReplica.ContainerID)
@@ -298,6 +310,10 @@ func (a *Agent) deleteFunctionHandler(w http.ResponseWriter, r *http.Request) {
 	copy(replicasToRemove, instance.Replicas)
 	delete(a.registry, functionName)
 	a.registryMu.Unlock()
+
+	if err := a.saveFunctionsState(); err != nil {
+		log.Printf("-> [State] Aviso ao salvar estado após remover '%s': %v\n", functionName, err)
+	}
 
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {

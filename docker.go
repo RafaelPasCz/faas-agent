@@ -60,27 +60,42 @@ func (a *Agent) createAndStartReplica(ctx context.Context, cli *client.Client, f
 		},
 	}
 
+	// Se já existir um container com esse nome no Docker, só o remove se for um container órfão do próprio faas-agent.
+	if existing, inspectErr := cli.ContainerInspect(ctx, replicaName); inspectErr == nil {
+		if existing.Config == nil || existing.Config.Labels["faas.function"] == "" {
+			return nil, fmt.Errorf("conflito: já existe um container externo '%s' no Docker que não pertence ao faas-agent", replicaName)
+		}
+		fmt.Printf("-> [Docker] Removendo container órfão de sessão anterior '%s'...\n", replicaName)
+		if rmErr := cli.ContainerRemove(ctx, replicaName, container.RemoveOptions{Force: true}); rmErr != nil {
+			return nil, fmt.Errorf("erro ao remover container órfão '%s': %w", replicaName, rmErr)
+		}
+	}
+
 	resp, err := cli.ContainerCreate(ctx, containerConfig, hostConfig, nil, nil, replicaName)
 	if err != nil {
 		return nil, fmt.Errorf("erro ao criar container '%s': %w", replicaName, err)
 	}
 
 	if err := cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		_ = cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
 		return nil, fmt.Errorf("erro ao iniciar container '%s': %w", replicaName, err)
 	}
 
 	inspect, err := cli.ContainerInspect(ctx, resp.ID)
 	if err != nil {
+		_ = cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
 		return nil, fmt.Errorf("erro ao inspecionar container '%s': %w", replicaName, err)
 	}
 
 	bindings := inspect.NetworkSettings.Ports[exposedPort]
 	if len(bindings) == 0 || bindings[0].HostPort == "" {
+		_ = cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
 		return nil, fmt.Errorf("nenhuma porta foi mapeada no host para a réplica '%s'", replicaName)
 	}
 	hostPort := bindings[0].HostPort
 
 	if err := a.waitForContainerHealth(functionName, hostPort); err != nil {
+		_ = cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
 		return nil, err
 	}
 
