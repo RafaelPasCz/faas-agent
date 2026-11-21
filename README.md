@@ -36,25 +36,21 @@ O `faas-agent` foi projetado sob a filosofia Unix: é um componente **100% autô
 
 ---
 
-## Padrão de Container de Função (Runtime Python)
+## Padrão de Container de Função (Contrato HTTP)
 
-Em `templates/python3-http/` está o template base para criação de funções em Python (`python:3.12-slim` + `Flask` + `Waitress`):
+O `faas-agent` é agnóstico à linguagem, desde que a imagem Docker da função cumpra o contrato HTTP esperado pelo agente:
 
 - **Porta interna padrão:** `8080/tcp`
-- **Threads por réplica (`WORKERS`):** `8` worker threads por padrão (configurável via variável de ambiente `WORKERS`).
-- **Rotas internas do container:**
-  - `GET /health`: Healthcheck consultado pelo agente no deploy, no *Scale-Up* e no *Cold Start*.
-  - `POST /`: Recebe o evento repassado pelo agente e executa `handle(event, context)` em `function/handler.py`.
+- **Healthcheck (`GET /health`):** consultado pelo agente no deploy, no *Scale-Up* e no *Cold Start* (deve responder `200 OK`).
+- **Invocação (`POST /`):** recebe o payload encaminhado pelo agente e retorna a resposta da função.
 
-Para construir a imagem de exemplo localmente:
-```bash
-docker build -t switchfaas/hello-python:latest ./templates/python3-http
-```
+Os templates prontos (como `python3-http`, baseado em `python:3.12-slim` + `Flask` + `Waitress`) e a geração de novas funções ficam no módulo separado **`faas-cli`** (diretório irmão `../faas-cli`):
 
-Para criar uma nova função customizada em `functions/<nome>/` a partir de um template:
 ```bash
+cd ../faas-cli
 go run . templates
 go run . new python3-http minha-funcao
+docker build -t switchfaas/hello-python:latest ./functions/minha-funcao
 ```
 
 ---
@@ -85,8 +81,6 @@ go run . new python3-http minha-funcao
 ```text
 faas-agent/
 ├── main.go       # Struct Agent, injeção de dependências e inicialização do servidor HTTP
-├── cli.go        # Subcomandos CLI (new, templates embutidos/functions/, deploy, functions, invoke, logs, delete)
-├── cli_test.go   # Testes unitários dos subcomandos CLI
 ├── models.go     # Constantes, structs de domínio e cálculo de snapshot consolidado
 ├── handlers.go   # Handlers HTTP (/deploy, /functions, /function/{name}, /invoke/{name})
 ├── docker.go     # Ciclo de vida de containers, Cold Start, Auto-Scaling e Idle Reaper
@@ -96,32 +90,19 @@ faas-agent/
 
 ---
 
-## Uso via CLI
+## Uso via CLI (`faas-cli`)
 
-Com o servidor HTTP do `faas-agent` rodando em um terminal (`go run .` ou `go run . serve`), você pode gerenciar todo o ciclo de vida das funções pelo terminal sem precisar montar chamadas `curl` manualmente (use `FAAS_AGENT_URL` ou `--url` caso o agente esteja em outro host/porta):
+A interface de linha de comando foi separada para o módulo independente **`faas-cli`** (em `../faas-cli/`), mantendo o `faas-agent` focado exclusivamente no servidor HTTP do *Data Plane*.
+
+Com o `faas-agent` em execução, você pode apontar a CLI para qualquer instância passando `--gateway` / `-g` ou `FAAS_GATEWAY` (padrão `http://localhost:8081`):
 
 ```bash
-# 1. Listar templates e criar uma função local em functions/
-go run . templates
-go run . new python3-http hello-python
-
-# 2. Implantar a função no agente (com parâmetros opcionais de escala)
-go run . deploy hello-python switchfaas/hello-python:latest --max-replicas 3 --max-concurrency 4
-
-# 3. Listar funções implantadas ou detalhar réplicas de uma função
-go run . functions
-go run . functions hello-python
-
-# 4. Invocar a função (inline ou via stdin com '-d -')
-go run . invoke hello-python -d '{"name": "Rafael"}'
-echo '{"name": "Rafael"}' | go run . invoke hello-python -d -
-
-# 5. Consultar logs de execução (com filtros opcionais)
-go run . logs
-go run . logs hello-python -n 10 --after-id 5
-
-# 6. Remover a função e suas réplicas
-go run . delete hello-python
+cd ../faas-cli
+go run . --gateway http://localhost:8081 deploy hello-python switchfaas/hello-python:latest
+go run . --gateway http://localhost:8081 functions
+go run . --gateway http://localhost:8081 invoke hello-python -d '{"name": "Rafael"}'
+go run . --gateway http://localhost:8081 logs hello-python
+go run . --gateway http://localhost:8081 delete hello-python
 ```
 
 ---
@@ -231,7 +212,7 @@ curl -X DELETE http://localhost:8081/function/hello-python
 - [x] Servidor HTTP nativo na porta `:8081`
 - [x] Integração com Docker Daemon via SDK oficial (`ImagePull`, `ContainerCreate`, `ContainerStart`)
 - [x] Endpoint `POST /deploy` com verificação de imagem local
-- [x] Padronização de containers de funções (contrato de porta/healthcheck e template Python em `templates/python3-http`)
+- [x] Padronização de containers de funções (contrato de porta `8080/tcp`, `GET /health` e `POST /`)
 - [x] Mapeamento dinâmico de portas (*Port Binding*) por réplica
 - [x] Endpoint de invocação (`POST /invoke/{functionName}`) com medição de latência e pool de conexões HTTP *Keep-Alive*
 - [x] Gerenciamento de ciclo de vida (`GET /functions`, `GET /function/{functionName}`, `DELETE /function/{functionName}`, *Scale-to-Zero* com `ContainerStop` e *Cold Start* automático)
