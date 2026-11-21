@@ -85,12 +85,43 @@ go run . new python3-http minha-funcao
 ```text
 faas-agent/
 ├── main.go       # Struct Agent, injeção de dependências e inicialização do servidor HTTP
+├── cli.go        # Subcomandos CLI (new, templates embutidos/functions/, deploy, functions, invoke, logs, delete)
+├── cli_test.go   # Testes unitários dos subcomandos CLI
 ├── models.go     # Constantes, structs de domínio e cálculo de snapshot consolidado
 ├── handlers.go   # Handlers HTTP (/deploy, /functions, /function/{name}, /invoke/{name})
 ├── docker.go     # Ciclo de vida de containers, Cold Start, Auto-Scaling e Idle Reaper
 ├── state.go      # Persistência de funções (data/functions.json) e reconciliação no boot
-├── template.go   # Subcomandos CLI (new, templates) e cópia de templates para functions/
 └── logs.go       # ExecutionLogStore (.jsonl append-only + compactação atômica) e GET /logs
+```
+
+---
+
+## Uso via CLI
+
+Com o servidor HTTP do `faas-agent` rodando em um terminal (`go run .` ou `go run . serve`), você pode gerenciar todo o ciclo de vida das funções pelo terminal sem precisar montar chamadas `curl` manualmente (use `FAAS_AGENT_URL` ou `--url` caso o agente esteja em outro host/porta):
+
+```bash
+# 1. Listar templates e criar uma função local em functions/
+go run . templates
+go run . new python3-http hello-python
+
+# 2. Implantar a função no agente (com parâmetros opcionais de escala)
+go run . deploy hello-python switchfaas/hello-python:latest --max-replicas 3 --max-concurrency 4
+
+# 3. Listar funções implantadas ou detalhar réplicas de uma função
+go run . functions
+go run . functions hello-python
+
+# 4. Invocar a função (inline ou via stdin com '-d -')
+go run . invoke hello-python -d '{"name": "Rafael"}'
+echo '{"name": "Rafael"}' | go run . invoke hello-python -d -
+
+# 5. Consultar logs de execução (com filtros opcionais)
+go run . logs
+go run . logs hello-python -n 10 --after-id 5
+
+# 6. Remover a função e suas réplicas
+go run . delete hello-python
 ```
 
 ---

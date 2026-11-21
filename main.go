@@ -44,8 +44,11 @@ func NewAgent(logStore *ExecutionLogStore, stateFilePath string) *Agent {
 }
 
 func main() {
-	if len(os.Args) > 1 {
-		runCLI(os.Args[1:])
+	if len(os.Args) > 1 && os.Args[1] != "serve" {
+		if err := runCLI(os.Args[1:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Erro: %v\n", err)
+			os.Exit(1)
+		}
 		return
 	}
 
